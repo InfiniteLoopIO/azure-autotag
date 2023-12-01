@@ -1,0 +1,138 @@
+<#
+Copyright 2023 infiniteloop.io
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+#>
+
+param($eventGridEvent, $TriggerMetadata)
+
+# terraform template file
+
+# https://stackoverflow.com/a/69063542
+function Get-AzToken {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [String]
+        $resourceUri,
+        [Switch]$asHeader
+    ) 
+    $context = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureRmProfileProvider]::Instance.Profile.DefaultContext
+    $token = [Microsoft.Azure.Commands.Common.Authentication.AzureSession]::Instance.AuthenticationFactory.Authenticate($context.Account, $context.Environment, $context.Tenant.Id.ToString(), $null, [Microsoft.Azure.Commands.Common.Authentication.ShowDialog]::Never, $null, $resourceUri).AccessToken
+    if ($asHeader) {
+        return @{headers = @{Authorization = "Bearer $token" } }
+    }
+    return $token
+    
+}
+
+#display in json format
+$eventGridEvent | ConvertTo-Json -Depth 10 | write-host
+
+write-host "##########################################################################################"
+$resourceId = $eventGridEvent.data.resourceUri
+$eventTime = ([datetime]$eventGridEvent.eventTime).tostring('s') +"Z"
+$caller = $eventGridEvent.data.claims.name
+$operationName = $eventGridEvent.data.operationName
+
+write-host "^^^^^^^^^^"
+($eventGridEvent.data.authorization.evidence).getenumerator() | ConvertTo-Json -depth 10 | write-host
+write-host "^^^^^^^^^^"
+
+if ($null -eq $caller) {
+    #check if caller is service principal and attempt to discover DisplayName
+    #if displayname cannot be discovered return appid
+    
+    #$graphToken = Get-AzToken -ResourceUri 'https://graph.microsoft.com/'
+    #Connect-MgGraph -AccessToken ($graphToken | ConvertTo-SecureString -AsPlainText -Force)
+    #Get-MgContext |ConvertTo-Json -Depth 10 | Write-Host
+    
+    #function running as Managed System Idenity with delegated directory.read.all so it should be able to resolve service principal name 
+    if ($eventGridEvent.data.authorization.evidence.principalType -eq "ServicePrincipal") {
+
+        write-host "Caller appears to be service principal, checking appID $($eventGridEvent.data.claims.appid)..."
+        $caller = (Get-AzADServicePrincipal -applicationID $eventGridEvent.data.claims.appid).DisplayName
+        if ($null -eq $caller) {
+            Write-Host "MSI may not have permission to read the applications from the directory"
+            $caller = "appID:$($eventGridEvent.data.claims.appid)"
+        }
+        else{
+            $caller = $caller + ";appID=$($eventGridEvent.data.claims.appid)"
+        }
+    }
+}
+else{
+    #add email address if caller is not service principal
+    $caller = $caller +";emailAddress="+ $eventGridEvent.data.claims.'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress'
+}
+
+#display vars
+Write-Host "Caller: $caller"
+Write-Host "ResourceId: $resourceId"
+Write-Host "OperationName: $operationName"
+Write-Host "EventTime: $eventTime"
+
+if (($null -eq $caller) -or ($null -eq $resourceId)) {
+    Write-Host "ResourceId or Caller is null"
+    exit;
+}
+
+#skip resoruce if it is a deployment, tag update, or the function itself
+$skipResource = $false
+$autoTagFunctionAppName = "${functionAppName}"  # this should match name of the function app so it can ignore itself when the function creates tags on other resources
+
+$resourceIdIgnoreRegex = "Microsoft\.Resources/(deployments|tags)|Microsoft\.EventGrid/systemTopics|Microsoft\.Authorization/roleAssignments|proactiveDetectionConfigs|$autoTagFunctionAppName`$"
+if ($resourceId -match $resourceIdIgnoreRegex) {
+    Write-Host "Skipping event as resourceId matches $resourceIdIgnoreRegex"
+    $skipResource = $true
+}
+
+$operationNameIgnoreRegex = "Microsoft\.Resources/tags/write"
+if (($skipResource -eq $false) -and ($operationName -match $operationNameIgnoreRegex)) {
+    Write-Host "Skipping event as operationName matches $operationNameIgnoreRegex"
+    $skipResource = $true
+}
+
+if($skipResource -eq $false){
+    $tags = (Get-AzTag -ResourceId $resourceId).Properties
+    
+    $autoTagArray = @( @{'autotag-createdBy' = $caller}, @{'autotag-createdDate' = $eventTime} )
+    
+    # prevent updating original creation details by checking for existing tag keys
+    foreach($autoTag in $autoTagArray){
+        
+        if($tags.tagsproperty.count -gt 0){
+            write-host "Tag Name: $($autotag.getenumerator().name)"
+            
+            if (!($tags.TagsProperty.ContainsKey($autotag.GetEnumerator().name))) {
+                Update-AzTag -ResourceId $resourceId -Operation Merge -Tag $autotag | out-null
+                Write-Host "Added tag:"
+                $autotag.getenumerator() | ForEach-Object {$_.name +"`t"+ $_.value} | out-string | write-host
+            }
+            else {
+                Write-Host "Tag already exists, no updates made"
+            }
+            
+        }
+        else{
+            
+            write-host "No existing tags found on resource during initial discovery"
+            Update-AzTag -ResourceId $resourceId -Operation Merge -Tag $autotag | out-null
+            Write-Host "Added tag:"
+            $autotag.getenumerator() | ForEach-Object {$_.name +"`t"+ $_.value} | out-string | write-host 
+            
+        }
+    }
+}
+
+write-host "##########################################################################################"

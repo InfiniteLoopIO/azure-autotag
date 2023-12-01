@@ -1,0 +1,10 @@
+resource_group_name          = "rg-autotag"
+resource_group_location      = "centralus"
+
+autotag_resource_prefix      = "autotag"
+
+#full name must be globally unique
+storage_account_name_suffix  = "stgacct01"
+
+#full name must be globally unique
+function_app_name_suffix     = "function-app"
